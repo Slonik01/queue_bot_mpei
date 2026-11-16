@@ -70,6 +70,8 @@ def render_group_message(q, members, cfg, bot_username):
     link = f'https://t.me/{bot_username}?start=q_{qid}'
     if q['status'] == 'registration':
         text.append(f"⏳ Запись открыта до: {show_time(q['closes_at'], cfg)}")
+        if not q['use_preferences']:
+            text.append('🎲 Случайная жеребьёвка')
         text.extend(['', '<b>Записались:</b>'])
         text.extend(f"• {esc(short_name(m['name']))}" for m in members)
         if not members:
@@ -112,10 +114,11 @@ def personal_message(db, qid, uid, cfg, view='main', notice=None):
 
     status = q['status']
     if status == 'registration':
-        text.extend(['', '✅ Ты в очереди.',
-                     f"🎯 Выбор: <b>{esc(preference_label(member))}</b>",
-                     f"⏳ Запись до {show_time(q['closes_at'], cfg)}"])
-        if view == 'number':
+        text.extend(['', '✅ Ты в очереди.'])
+        if q['use_preferences']:
+            text.append(f"🎯 Выбор: <b>{esc(preference_label(member))}</b>")
+        text.append(f"⏳ Запись до {show_time(q['closes_at'], cfg)}")
+        if view == 'number' and q['use_preferences']:
             text.extend(['', f'🔢 <b>Напиши число от 1 до {cfg.max_participants} в этот чат.</b>',
                          'Например: 3. Введённое сообщение будет удалено после обработки.',
                          'Если участников будет меньше, выбранный номер станет последним.'])
@@ -123,10 +126,15 @@ def personal_message(db, qid, uid, cfg, view='main', notice=None):
         if view == 'leave_confirm':
             text.extend(['', 'Точно выйти из очереди? Штрафа за выход нет.'])
             return '\n'.join(text), ik([[('🚪 Да, выйти', f'leaveyes:{qid}', 'danger')], [('↩️ Назад', f'show:{qid}')]])
-        text.append('\nДо жеребьёвки можно менять выбор и выходить из очереди.')
-        return '\n'.join(text), ik([[('🔢 Конкретный номер', f'exact:{qid}', 'primary'),
-                                     ('🎲 Случайное место', f'pref:{qid}:any', 'success')],
-                                    [('🚪 Выйти из очереди', f'leave:{qid}', 'danger')]])
+        buttons = []
+        if q['use_preferences']:
+            text.append('\nДо жеребьёвки можно менять выбор и выходить из очереди.')
+            buttons.append([('🔢 Конкретный номер', f'exact:{qid}', 'primary'),
+                            ('🎲 Случайное место', f'pref:{qid}:any', 'success')])
+        else:
+            text.append('\n🎲 Место определит случайная жеребьёвка.')
+        buttons.append([('🚪 Выйти из очереди', f'leave:{qid}', 'danger')])
+        return '\n'.join(text), ik(buttons)
 
     if status == 'active':
         text.extend(['', f"🎫 <b>Твоё место: №{member['current_position']}</b>"])

@@ -89,7 +89,7 @@ async def register_commands(bot):
         ('help', 'Помощь'),
     ]
     group_admin = [
-        ('queue', 'Создать очередь: /queue предмет дата время срок'),
+        ('queue', 'Создать очередь: /queue [предмет] дата время срок [0 или 1]'),
         ('close_reg', 'Закрыть запись: /close_reg ID'),
         ('finish_lesson', 'Завершить пару: /finish_lesson ID'),
         ('cancel', 'Отменить очередь: /cancel ID'),
@@ -172,17 +172,15 @@ async def _refresh_panel(bot, qid, uid, view, notice, create_if_missing):
     if not q or q['status'] in TERMINAL_CARD_TEXT:
         return False
     current = panel_row(qid, uid)
-    if view is not None and current:
-        save_view(qid, uid, view)
     selected = view if view is not None else (current['view'] if current else 'main')
     if (selected == 'swaps' and q['status'] != 'active') or (selected == 'leave_confirm' and q['status'] not in ('registration', 'active')):
         selected = 'main'
-    if q['status'] != 'registration' and selected == 'number':
+    if selected == 'number' and (q['status'] != 'registration' or not q['use_preferences']):
         selected = 'main'
     if selected == 'stats':  # Handle dashboards left in the SQLite DB by v2.5.
         selected = 'main'
-        if current:
-            save_view(qid, uid, selected)
+    if current and selected != current['view']:
+        save_view(qid, uid, selected)
     if selected in ('help', 'info'):
         text, markup = INFO, ik([[('↩️ К очереди', f'show:{qid}')]])
     else:
@@ -240,12 +238,14 @@ async def is_member(bot, chat_id, uid):
 INFO = (
     '📘 <b>Как работает бот очередей</b>\n\n'
     '1. Администратор создаёт очередь в нужной теме командой '
-    '<code>/queue предмет дата время срок_записи</code>. Например, '
-    '<code>/queue Программирование 25.12.2026 13:45 6ч</code>.\n'
-    '2. Участник нажимает «Записаться» в группе, в личке выбирает конкретный '
-    'номер или случайное место. До закрытия записи выбор можно поменять.\n'
-    '3. После окончания записи бот распределяет номера с учётом пожеланий '
-    'и истории удачных/неудачных жеребьёвок (не ниже 95% от оптимума).\n'
+    '<code>/queue [предмет] дата время срок_записи [режим]</code>. '
+    'Без предмета берётся известное название темы или название чата.\n'
+    '2. Участник нажимает «Записаться» в группе. В режиме 1 (по умолчанию) '
+    'в личке можно выбрать номер или случайное место и поменять выбор до закрытия записи. '
+    'В режиме 0 достаточно записаться.\n'
+    '3. После окончания записи бот проводит жеребьёвку. В режиме 1 он учитывает '
+    'пожелания и историю жеребьёвок (не ниже 95% от оптимума). В режиме 0 '
+    'порядок участников определяется случайно.\n'
     '4. После жеребьёвки можно предлагать обмены и выходить без штрафов. '
     'Если выйти до начала пары, можно вернуться в конец очереди.\n'
     '5. Ровно через 1 час 40 минут после начала пары очередь автоматически '
@@ -321,19 +321,60 @@ def parse_queue_id(value):
     raise DomainError('Неверный ID очереди.')
 
 
+def remember_topic_name(message):
+    created = getattr(message, 'forum_topic_created', None)
+    event = created or getattr(message, 'forum_topic_edited', None)
+    title = getattr(event, 'name', None)
+    if not title:
+        return None
+    thread_id = getattr(message, 'message_thread_id', None)
+    if thread_id is None and created:
+        thread_id = message.message_id
+    if thread_id is None:
+        return None
+    updated_at = getattr(message, 'date', None) or utc_now()
+    DB.remember_topic(message.chat.id, thread_id, title, utc_iso(updated_at))
+    return title
+
+
+@router.message(F.chat.type.in_(GROUP_TYPES), F.forum_topic_created)
+@router.message(F.chat.type.in_(GROUP_TYPES), F.forum_topic_edited)
+async def cache_topic_name(message: Message):
+    remember_topic_name(message)
+
+
+def default_queue_title(message, thread_id):
+    if thread_id is not None:
+        title = DB.topic_title(message.chat.id, thread_id)
+        if title:
+            return title
+        reply = getattr(message, 'reply_to_message', None)
+        if getattr(reply, 'message_id', None) == thread_id:
+            title = remember_topic_name(reply)
+            if title:
+                return title
+    return getattr(message.chat, 'title', None) or ''
+
+
 @router.message(Command('queue'), F.chat.type.in_(GROUP_TYPES))
 async def create_queue(message: Message, bot: Bot):
     try:
-        parts = command_args(message).rsplit(maxsplit=3)
-        if len(parts) != 4:
+        parts = command_args(message).rsplit(maxsplit=4)
+        use_preferences = True
+        # A bare 1 following the lesson time is a duration in hours.
+        if len(parts) >= 4 and parts[-1] in ('0', '1') and ':' in parts[-3]:
+            use_preferences = parts.pop() == '1'
+        if len(parts) < 3:
             return
         if not message.from_user or not await is_admin(bot, message.chat.id, message.from_user.id):
             return
-        title, date, time, duration = parts
+        date, time, duration = parts[-3:]
         lesson = parse_lesson_time(f'{date} {time}')
         hours = parse_registration_hours(duration)
+        thread_id = getattr(message, 'message_thread_id', None)
+        title = ' '.join(parts[:-3]) or default_queue_title(message, thread_id)
         qid = SERVICE.create(message.chat.id, message.from_user.id, title, lesson, hours,
-                             message_thread_id=getattr(message, 'message_thread_id', None))
+                             message_thread_id=thread_id, use_preferences=use_preferences)
         await publish_group(bot, qid)
     except DomainError as exc:
         logger.debug('Queue command ignored in chat %s: %s', message.chat.id, exc)
@@ -524,7 +565,8 @@ async def ask_exact(call: CallbackQuery, bot: Bot):
     q = DB.queue(qid)
     user = DB.one("SELECT 1 FROM participants WHERE queue_id=? AND user_id=? AND status='joined'",
                   (qid, call.from_user.id))
-    if not q or q['status']!='registration' or utc_iso(utc_now()) >= q['closes_at'] or not user:
+    if (not q or not q['use_preferences'] or q['status'] != 'registration'
+            or utc_iso(utc_now()) >= q['closes_at'] or not user):
         await call.answer()
         return
     # The DB-stored dashboard view survives bot restarts; no in-memory FSM needed.

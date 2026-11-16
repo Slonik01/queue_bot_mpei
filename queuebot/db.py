@@ -20,7 +20,8 @@ QUEUE_COLUMNS = """
  group_message_id INTEGER, message_thread_id INTEGER, seed TEXT NOT NULL, seed_hash TEXT NOT NULL,
  revision INTEGER NOT NULL DEFAULT 0,
  created_at TEXT NOT NULL, title TEXT NOT NULL,
- group_synced_revision INTEGER NOT NULL DEFAULT -1, group_retry_at TEXT
+ group_synced_revision INTEGER NOT NULL DEFAULT -1, group_retry_at TEXT,
+ use_preferences INTEGER NOT NULL DEFAULT 1 CHECK(use_preferences IN (0,1))
 """
 
 SCHEMA = f"""
@@ -71,6 +72,11 @@ CREATE TABLE IF NOT EXISTS personal_panels (
  message_id INTEGER NOT NULL,
  view TEXT NOT NULL DEFAULT 'main',
  PRIMARY KEY(queue_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS forum_topics (
+ chat_id INTEGER NOT NULL, message_thread_id INTEGER NOT NULL,
+ title TEXT NOT NULL, updated_at TEXT NOT NULL,
+ PRIMARY KEY(chat_id, message_thread_id)
 );
 CREATE TABLE IF NOT EXISTS events (
  id INTEGER PRIMARY KEY AUTOINCREMENT, queue_id INTEGER NOT NULL,
@@ -201,6 +207,9 @@ class Database:
                 columns = {row['name'] for row in conn.execute('PRAGMA table_info(queues)')}
                 if 'group_synced_revision' not in columns:
                     migrate_queue_identity(conn, columns)
+                elif 'use_preferences' not in columns:
+                    conn.execute('''ALTER TABLE queues ADD COLUMN use_preferences INTEGER
+                        NOT NULL DEFAULT 1 CHECK(use_preferences IN (0,1))''')
                 for statement in (*QUEUE_INDEXES, *QUEUE_TRIGGERS):
                     conn.execute(statement)
             conn.execute('PRAGMA foreign_keys=ON')
@@ -270,6 +279,18 @@ class Database:
     def exec(self, query, params=()):
         with self.tx() as conn:
             return conn.execute(query, params).rowcount
+
+    def remember_topic(self, chat_id, thread_id, title, updated_at):
+        self.exec("""INSERT INTO forum_topics(chat_id,message_thread_id,title,updated_at)
+            VALUES(?,?,?,?) ON CONFLICT(chat_id,message_thread_id) DO UPDATE SET
+                title=excluded.title, updated_at=excluded.updated_at
+            WHERE excluded.updated_at>=forum_topics.updated_at""",
+            (chat_id, thread_id, title, updated_at))
+
+    def topic_title(self, chat_id, thread_id):
+        topic = self.one('SELECT title FROM forum_topics WHERE chat_id=? AND message_thread_id=?',
+                         (chat_id, thread_id))
+        return topic['title'] if topic else None
 
     def user(self, tg_user, now: str):
         name = display_name(tg_user.username, tg_user.full_name or str(tg_user.id))[:120]

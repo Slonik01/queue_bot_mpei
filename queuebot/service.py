@@ -1,5 +1,6 @@
 """Business logic with database transactions; independent of Telegram handlers."""
 import json
+import random
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -15,10 +16,11 @@ class QueueService:
     def __init__(self, db, cfg):
         self.db, self.cfg = db, cfg
 
-    def create(self, chat_id, creator_id, title, lesson_at, hours, message_thread_id=None):
+    def create(self, chat_id, creator_id, title, lesson_at, hours, message_thread_id=None, *,
+               use_preferences=True):
         title = title.strip()
-        if not 1 <= len(title) <= 80:
-            raise DomainError('Название предмета должно содержать 1–80 символов.')
+        if not 1 <= len(title) <= 255:
+            raise DomainError('Название предмета должно содержать 1–255 символов.')
         if not 0.05 <= hours <= 168:
             raise DomainError('Время записи: от 3 минут до 7 дней.')
         now = utc_now()
@@ -38,11 +40,11 @@ class QueueService:
                     (chat_id, title, message_thread_id)).fetchone()
             try:
                 cur = conn.execute('''INSERT INTO queues(subject_id,chat_id,creator_id,lesson_at,
-                    closes_at,status,seed,seed_hash,created_at,message_thread_id,title)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
+                    closes_at,status,seed,seed_hash,created_at,message_thread_id,title,use_preferences)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
                     (subject['id'],chat_id,creator_id,utc_iso(lesson_at),
                      utc_iso(now+timedelta(hours=hours)),'registration',seed,digest,utc_iso(now),
-                     message_thread_id,title))
+                     message_thread_id,title,int(use_preferences)))
             except sqlite3.IntegrityError as exc:
                 if str(exc) == 'duplicate_queue':
                     raise DomainError('Очередь на эту дату и предмет уже существует.') from exc
@@ -115,6 +117,8 @@ class QueueService:
             q = conn.execute('SELECT * FROM queues WHERE id=?', (qid,)).fetchone()
             if not q or q['status'] != 'registration' or utc_iso(utc_now()) >= q['closes_at']:
                 raise DomainError('Пожелания уже нельзя менять.')
+            if not q['use_preferences']:
+                raise DomainError('В этой очереди места распределяются случайно.')
             changed = conn.execute('''UPDATE participants SET pref_mode=?,desired=?
                 WHERE queue_id=? AND user_id=? AND status='joined' ''',
                 (mode,desired if mode=='exact' else None,qid,uid)).rowcount
@@ -141,36 +145,50 @@ class QueueService:
             raise DomainError('Эта очередь уже обработана или отменена.')
         if utc_iso(utc_now()) < q['closes_at']:
             raise DomainError('Регистрация ещё идёт.')
-        people = self.candidates(qid)
-        assignment = Assignment(people)
-        seed = int(q['seed'],16)
-        positions = assignment.draw(seed)
-        # Fixed, transparent baseline samples. Only actual drawn positions affect the balance.
-        baseline = assignment.baseline_expected(seed ^ 0x5A17F00D, samples=40) if people else {}
+        seed = int(q['seed'], 16)
+        if q['use_preferences']:
+            people = self.candidates(qid)
+            assignment = Assignment(people)
+            positions = assignment.draw(seed)
+            baseline = assignment.baseline_expected(seed ^ 0x5A17F00D, samples=40) if people else {}
+            details = {'seed': q['seed'], 'max': assignment.max_utility, 'floor': assignment.floor}
+        else:
+            users = [member['user_id'] for member in self.db.members(qid)]
+            random.Random(seed).shuffle(users)
+            positions = {uid: position for position, uid in enumerate(users, start=1)}
+            details = {'seed': q['seed'], 'mode': 'random'}
         now = utc_iso(utc_now())
         with self.db.tx() as conn:
             stage = conn.execute('SELECT status,revision FROM queues WHERE id=?', (qid,)).fetchone()
             if stage['status'] != 'registration' or stage['revision'] != q['revision']:
                 raise DomainError('Состав очереди изменился. Пересчитайте жеребьёвку.')
-            for p in people:
-                pos = positions[p.user_id]
-                utility = satisfaction(p,pos,len(people))
-                conn.execute('''UPDATE participants SET original_position=?,current_position=?,
-                    original_satisfaction=?,expected_satisfaction=?,priority=?,
-                    balance_before=?,penalties_before=?,fairness_existed=?
-                    WHERE queue_id=? AND user_id=? AND status='joined' ''',
-                    (pos,pos,utility,baseline[p.user_id],int(p.priority),
-                     p.balance,0,int(p.fairness_existed),qid,p.user_id))
-                new_balance = max(-100, min(100,round(0.9*p.balance + baseline[p.user_id]-utility,3)))
-                conn.execute('''INSERT INTO fairness(subject_id,user_id,balance,exit_penalties,updated_at)
-                    VALUES(?,?,?,?,?) ON CONFLICT(subject_id,user_id) DO UPDATE SET
-                    balance=excluded.balance,exit_penalties=0,
-                    updated_at=excluded.updated_at''',
-                    (q['subject_id'],p.user_id,new_balance,0,now))
+            if q['use_preferences']:
+                self._record_preference_draw(conn, q, people, positions, baseline, now)
+            else:
+                conn.executemany("""UPDATE participants SET original_position=?,current_position=?
+                    WHERE queue_id=? AND user_id=? AND status='joined'""",
+                    ((pos, pos, qid, uid) for uid, pos in positions.items()))
             conn.execute("UPDATE queues SET status='active',revision=revision+1 WHERE id=?",(qid,))
-            self.db.event(conn,qid,None,'draw',json.dumps({'seed':q['seed'],
-                             'max':assignment.max_utility,'floor':assignment.floor},ensure_ascii=False),now)
+            self.db.event(conn, qid, None, 'draw', json.dumps(details), now)
         return positions
+
+    def _record_preference_draw(self, conn, queue, people, positions, baseline, now):
+        for person in people:
+            uid = person.user_id
+            pos = positions[uid]
+            expected = baseline[uid]
+            utility = satisfaction(person, pos, len(people))
+            conn.execute('''UPDATE participants SET original_position=?,current_position=?,
+                original_satisfaction=?,expected_satisfaction=?,priority=?,
+                balance_before=?,penalties_before=?,fairness_existed=?
+                WHERE queue_id=? AND user_id=? AND status='joined' ''',
+                (pos, pos, utility, expected, int(person.priority),
+                 person.balance, 0, int(person.fairness_existed), queue['id'], uid))
+            new_balance = max(-100, min(100, round(0.9 * person.balance + expected - utility, 3)))
+            conn.execute('''INSERT INTO fairness(subject_id,user_id,balance,exit_penalties,updated_at)
+                VALUES(?,?,?,?,?) ON CONFLICT(subject_id,user_id) DO UPDATE SET
+                balance=excluded.balance,exit_penalties=0,updated_at=excluded.updated_at''',
+                (queue['subject_id'], uid, new_balance, 0, now))
 
     def withdraw(self, qid, uid):
         now = utc_iso(utc_now())
